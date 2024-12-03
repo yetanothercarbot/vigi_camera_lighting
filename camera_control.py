@@ -13,6 +13,7 @@ class VigiCamera:
         self.username = None
         self.password_hash = None
         self.stok = None
+        self.online = None
         self.headers = {"Accept": "application/json", "Content-Type": "application/json; charset=UTF-8"}
 
         context = urllib3.util.create_urllib3_context()
@@ -21,10 +22,19 @@ class VigiCamera:
 
         self.http = urllib3.PoolManager(cert_reqs = "CERT_NONE", ssl_context=context)
 
+    def __str__(self):
+        if self.stok is None:
+            return f"Camera at {self.ip}, not authenticated"
+        elif self.online is not True:
+            return f"Camera at {self.ip}, not available"
+        else:
+            return f"Camera at {self.ip}, authenticated with user {self.username}"
+        
+
     """
     Authenticates the camera object.
     """
-    def auth(self, username: str, password: str) -> bool:
+    def auth(self, username: str, password: str) -> tuple:
         self.username = username
         self.password = password
         prefixed = f"TPCQ75NF2Y:{password}"
@@ -32,7 +42,13 @@ class VigiCamera:
 
         # Get nonce, encryption key info from camera
         authReqBody = {'user_management': {'get_encrypt_info': None}, 'method': 'do'}
-        authReq = self.http.request("POST", f"https://{self.ip}/", headers=self.headers, json=authReqBody)
+        try:
+            authReq = self.http.request("POST", f"https://{self.ip}/", headers=self.headers, json=authReqBody, timeout=2)
+        except urllib3.exceptions.MaxRetryError as te:
+            self.online = False
+            print(f"{self.ip} offline")
+            return (False, "Camera offline")
+        
         nonce = authReq.json()['data']['nonce']
         key = authReq.json()['data']['key']
 
@@ -51,28 +67,31 @@ class VigiCamera:
         if resp.json()["error_code"] == 0:
             print(resp.json())
             self.stok = resp.json()["stok"]
-            return True
+            self.online = True
+            print(f"Set stok: {self.stok} {resp.json()['stok']}")
+            return (True, "Successful")
         else:
-            print("Auth failed:", resp.json())
-            return False
+            return (False, f"Auth failed: {resp.json()}")
         
     def test_auth(self) -> bool:
         req = self.http.request("POST", f"https://{self.ip}/stok={self.stok}/ds", json={"image":{"name":"switch"},"method":"get"}, headers=self.headers)
         if req.json()["error_code"] == 0:
             return True
         else:
-            # Try to log out?
-            # self.http.request("POST", f"https://{self.ip}/stok={self.stok}/ds", json={"system":{"logout":None},"method":"do"}, headers=self.headers)
             # Try to re-auth
             return self.auth(self.username, self.password)
 
 
     def set_mode(self, lights_on: bool) -> None:
         if self.stok is None:
+            print(self)
             raise PermissionError("The camera is not yet authenticated.")
         
         if not self.test_auth():
             raise PermissionError("Unable to re-authenticate camera.")
+        
+        if not self.online:
+            raise TimeoutError("Camera unavailable")
 
         if lights_on:
             # Set night vision mode to colour (white LEDs), set illuminators to always on
@@ -98,7 +117,11 @@ def on_mqtt_message(client, userdata, msg):
     exp = re.compile(r"(?:vigi_leds/)(?P<cam>.+)(?:/mode)")
     match = exp.match(msg.topic)
     if match is not None:
-        cameras[match.group("cam")].set_mode(msg.payload.decode() == "on")
+        print(f"Received {match.group('cam')} - {cameras[match.group('cam')]}")
+        try:
+            cameras[match.group("cam")].set_mode(msg.payload.decode() == "on")
+        except:
+            pass
 
 
 cameras = {}
@@ -113,10 +136,11 @@ with open("config.json") as config_file:
 
     for camera_datum in config_data["cameras"]:
         cameras[camera_datum["name"]] = VigiCamera(camera_datum["ip"])
-        if cameras[camera_datum["name"]].auth(camera_datum["username"], camera_datum["password"]):
-            print(f"Authenticated {camera_datum['name']}")
+        auth_attempt = cameras[camera_datum["name"]].auth(camera_datum["username"], camera_datum["password"])
+        if auth_attempt[0]:
+            print(f"Authenticated {camera_datum['name']} - {cameras[camera_datum['name']].stok}")
         else:
-            print(f"Unable to authenticate {camera_datum['name']}")
+            print(f"Unable to authenticate {camera_datum['name']} - {auth_attempt[1]}")
 
     client.username_pw_set(config_data["mqtt_username"], config_data["mqtt_password"])
     client.connect(config_data["mqtt_host"], 1883, 60)
